@@ -1,5 +1,5 @@
-# ChampSim
-ChampSim is a trace-based simulator for a microarchitecture study
+#RL-Based Bypassing 
 
-# How To
-Please read the handout in detail to know more.
+The RL algorithm is defined in replacement/rl.llc_repl
+
+

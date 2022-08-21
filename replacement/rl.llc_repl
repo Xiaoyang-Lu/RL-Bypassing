@@ -48,7 +48,7 @@ int eq_hit = 0;
 int demand = 0;
 
 
-uint32_t eq_size = 16;
+uint32_t eq_size = LLC_SET * 16;
 uint32_t scooby_max_pcs = 5;
 uint32_t scooby_st_size = 64 * NUM_CPUS; 
 #define PC_SIG_SHIFT 4
@@ -781,9 +781,9 @@ void reward(Naper_EQEntry *eqentry)
 
 void print_eq(uint32_t set)
 {
-        for(uint32_t index = 0; index < evaluation_queue[set].size(); ++index)
+        for(uint32_t index = 0; index < evaluation_queue[0].size(); ++index)
         {
-		cout << "evaluation_queue" << " set: " << set << " index: " << index << " address: " <<  evaluation_queue[set][index]->address  << " insert time: " << evaluation_queue[set][index]->time << " reward: " << evaluation_queue[set][index]->reward << endl;
+		cout << "evaluation_queue" << " set: " << set << " index: " << index << " address: " <<  evaluation_queue[0][index]->address  << " insert time: " << evaluation_queue[0][index]->time << " reward: " << evaluation_queue[0][index]->reward << endl;
 	}
 }
 
@@ -791,11 +791,11 @@ void print_eq(uint32_t set)
 vector<Naper_EQEntry*> search_eq(uint64_t address, bool search_all, uint32_t set)
 {
 	vector<Naper_EQEntry*> entries;
-	for(uint32_t index = 0; index < evaluation_queue[set].size(); ++index)
+	for(uint32_t index = 0; index < evaluation_queue[0].size(); ++index)
 	{
-		if(evaluation_queue[set][index]->address == address && evaluation_queue[set][index]->has_reward == false)
+		if(evaluation_queue[0][index]->address == address && evaluation_queue[0][index]->has_reward == false)
 		{
-			entries.push_back(evaluation_queue[set][index]);
+			entries.push_back(evaluation_queue[0][index]);
 			if(search_all == false) 
 			{
 				break;
@@ -917,10 +917,10 @@ bool track(uint64_t address, State *state, uint32_t action_index, Naper_EQEntry 
 	}
 
 	Naper_EQEntry *eqentry = NULL;
-	if(evaluation_queue[set].size() >= eq_size)
+	if(evaluation_queue[0].size() >= eq_size)
 	{
-		eqentry = evaluation_queue[set].front();
-		evaluation_queue[set].pop_front();
+		eqentry = evaluation_queue[0].front();
+		evaluation_queue[0].pop_front();
 		if(last_evicted_eqentry[set])
 		{
 			//cout << "Evict Before Assign: " << endl;
@@ -935,7 +935,7 @@ bool track(uint64_t address, State *state, uint32_t action_index, Naper_EQEntry 
 	}
 	Naper_EQEntry *new_eqentry = NULL;
 	new_eqentry = new Naper_EQEntry(address, state, action_index, in_cache, time);
-	evaluation_queue[set].push_back(new_eqentry);
+	evaluation_queue[0].push_back(new_eqentry);
 
 	(*tracker) = new_eqentry;
 	return new_addr;

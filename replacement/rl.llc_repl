@@ -42,7 +42,7 @@
 
 uint32_t cal_level = 0;
 uint32_t set_sample[LLC_SET];
-#define NUM_LEADER_SETS   64
+#define NUM_LEADER_SETS LLC_SET
 uint32_t c = 0;
 int eq_hit = 0;
 int demand = 0;
@@ -1043,11 +1043,9 @@ void CACHE::llc_initialize_replacement()
 	int leaders = 0;
     	while(leaders < NUM_LEADER_SETS)
 	{
-		int LLC_SETS = LLC_SET;
-		int randval = rand() % LLC_SETS;
-		if(set_sample[randval] == 0)
+		if(set_sample[leaders] == 0)
 		{
-			set_sample[randval] = 1;
+			set_sample[leaders] = 1;
 			leaders++;
       		}
     	}

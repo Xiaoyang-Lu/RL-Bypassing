@@ -10,7 +10,7 @@ The Q-Table are updated when the entry are evicted from the EQ.
 Features used are: PC, Page, last 5 PCs.   
 Two actions are 0: inserting, 1: bypassing.   
 Rewards: 10 for good decision, -10 for bad decision.     
-64 sampled sets are used to observe the access patterns; 64 EQs are used (one EQ for one sampled set), each has 16 entry.
+64 sampled sets are used to observe the access patterns; 64 EQs are used (one EQ for one sampled set), each has 16 entries.
 
 #### Download the traces (memory-intensive SPEC CPU2006 and 2017 traces):
 > cd scripts/  

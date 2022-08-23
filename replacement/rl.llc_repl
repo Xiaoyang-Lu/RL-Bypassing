@@ -1073,7 +1073,7 @@ uint32_t CACHE::llc_update_bypass_state_decision(uint32_t cpu, uint32_t set, uin
 
 	//cout << "Current Time: " << time << endl;
 
-	if(set_sample[set] == 1)
+	if(set_sample[set] == 1 && type != WRITEBACK)
 	{
 		demand++;
 	

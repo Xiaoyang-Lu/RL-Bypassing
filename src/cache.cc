@@ -225,7 +225,7 @@ void CACHE::handle_fill()
               
             // update replacement policy
             if (cache_type == IS_LLC) {
-		action = llc_update_bypass_state_decision(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0, 0, current_core_cycle[fill_cpu]);
+		//action = llc_update_bypass_state_decision(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0, 0, current_core_cycle[fill_cpu]);
                 llc_update_replacement_state(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0,  0);
                 //stats.llc_update_replacement_state(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0, 1, 0, 0); 
 	    }

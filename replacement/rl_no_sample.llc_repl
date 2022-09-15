@@ -1,0 +1,1218 @@
+#include "cache.h"
+#include <algorithm>
+#include "cache.h"
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <vector>
+#include <cstdint>
+#include <string>
+#include <sstream>
+#include <random>
+#include <string.h>
+#include <iostream>
+
+#define INSERTING 0
+#define BYPASSING 1
+
+#define EPSILON 0.01831563888
+#define ALPHA 0.44932896411
+#define GAMMA 0.08208499862
+#define NUM_FEATURE 2
+#define NUM_TILING 3
+#define NUM_TILE 128
+#define NUM_ACTION 2 // 0: inserting, 1: bypassing
+#define SEED 200
+#define HASH_TYPE 2
+
+#define GOOD_DECISION_LOW_CAL_TYPE 0
+#define GOOD_DECISION_HIGH_CAL_TYPE 1
+#define BAD_DECISION_LOW_CAL_TYPE 2
+#define BAD_DECISION_HIGH_CAL_TYPE 3
+
+
+#define GOOD_DECISION_LOW_CAL 10
+#define GOOD_DECISION_HIGH_CAL 10
+#define BAD_DECISION_LOW_CAL -10
+#define BAD_DECISION_HIGH_CAL -10
+
+#define REWARD_ALL 0
+#define N 999999
+
+
+uint32_t cal_level = 0;
+uint32_t set_sample[LLC_SET];
+#define NUM_LEADER_SETS LLC_SET
+uint32_t c = 0;
+int eq_hit = 0;
+int demand = 0;
+
+
+uint32_t eq_size = 64 * 16;
+uint32_t scooby_max_pcs = 5;
+uint32_t scooby_st_size = 64 * NUM_CPUS; 
+#define PC_SIG_SHIFT 4
+#define PC_SIG_MAX_BITS 32
+
+class Scooby_STEntry
+{
+public:
+	uint64_t page;
+	deque<uint64_t> pcs;
+
+public:
+	Scooby_STEntry(uint64_t p, uint64_t pc, uint32_t offset) : page(p)
+	{
+		pcs.clear();
+		pcs.push_back(pc);
+	}
+	~Scooby_STEntry(){}
+	uint32_t get_pcs_sig();
+	void update(uint64_t page, uint64_t pc, uint32_t offset, uint64_t address);
+};
+
+void Scooby_STEntry::update(uint64_t page, uint64_t pc, uint32_t offset, uint64_t address)
+{
+	assert(this->page == page);
+	//cout << "page: " << page <<  " pc: " << pc << " size: " << this->pcs.size() << endl;
+
+	/* insert PC */
+	if(this->pcs.size() >= scooby_max_pcs)
+	{
+		this->pcs.pop_front();
+	}
+	this->pcs.push_back(pc);
+}
+
+
+uint32_t Scooby_STEntry::get_pcs_sig()
+{
+	uint32_t signature = 0;
+
+	/* compute signature only using last 5 PCs */
+	uint32_t n = pcs.size();
+	uint32_t ptr = (n >= 5) ? (n - 5) : 0;
+
+	for(uint32_t index = ptr; index < pcs.size(); ++index)
+	{
+		signature = (signature << PC_SIG_SHIFT);
+		signature = (signature ^ pcs[index]);
+	}
+	signature = signature & ((1ull << PC_SIG_MAX_BITS) - 1);
+	return signature;
+}
+
+
+deque<Scooby_STEntry*> signature_table;
+
+class State
+{
+public:
+        uint64_t pc;
+        uint64_t address;
+        uint64_t page;
+        uint32_t offset;
+        uint32_t core;
+	uint32_t pc_path;
+
+        void reset()
+        {
+                pc = 0xdeadbeef;
+                address = 0xdeadbeef;
+                page = 0xdeadbeef;
+                offset = 0;
+                core = 0;
+        	pc_path = 0;
+	}
+        State(){reset();}
+        ~State(){}
+};
+
+
+class Naper_EQEntry
+{
+	public:
+        uint64_t address;
+        State *state;
+        uint32_t action_index;
+        int32_t reward;
+        int32_t reward_type;
+        bool has_reward;
+	bool in_cache;
+	uint64_t time;
+        Naper_EQEntry(uint64_t ad, State *st, uint32_t ac, bool ic, uint64_t ti) : address(ad), state(st), action_index(ac), in_cache(ic), time(ti)
+        {
+                reward = 0;
+                reward_type = -1;
+                has_reward = false;
+        }
+		~Naper_EQEntry(){}
+};
+
+
+
+
+
+deque<Naper_EQEntry*> evaluation_queue[LLC_SET];
+float q_table[NUM_FEATURE][NUM_TILING][NUM_TILE][NUM_ACTION];
+Naper_EQEntry* last_evicted_eqentry[LLC_SET];
+
+
+
+const uint32_t tiling_offset[] = {	0xaca081b9,0x666a1c67,0xc11d6a53,0x8e5d97c1,0x0d1cad54,0x874f71cb,0x20d2fa13,0x73f7c4a7,
+									0x0b701f6c,0x8388d86d,0xf72ac9f2,0xbab16d82,0x524ac258,0xb5900302,0xb48ccc72,0x632f05bf,
+									0xe7111073,0xeb602af4,0xf3f29ebb,0x2a6184f2,0x461da5da,0x6693471d,0x62fd0138,0xc484efb3,
+									0x81c9eeeb,0x860f3766,0x334faf86,0x5e81e881,0x14bc2195,0xf47671a8,0x75414279,0x357bc5e0
+								};
+
+
+
+
+class HashZoo
+{
+public:
+	static uint32_t jenkins(uint32_t key);
+	static uint32_t knuth(uint32_t key);
+	static uint32_t murmur3(uint32_t key);
+	static uint32_t jenkins32(uint32_t key);
+	static uint32_t hash32shift(uint32_t key);
+	static uint32_t hash32shiftmult(uint32_t key);
+	static uint32_t hash64shift(uint32_t key);
+	static uint32_t hash5shift(uint32_t key);
+	static uint32_t hash7shift(uint32_t key);
+	static uint32_t Wang6shift(uint32_t key);
+	static uint32_t Wang5shift(uint32_t key);
+	static uint32_t Wang4shift( uint32_t key);
+	static uint32_t Wang3shift( uint32_t key);
+
+    static uint32_t three_hybrid1(uint32_t key);
+    static uint32_t three_hybrid2(uint32_t key);
+    static uint32_t three_hybrid3(uint32_t key);
+    static uint32_t three_hybrid4(uint32_t key);
+    static uint32_t three_hybrid5(uint32_t key);
+    static uint32_t three_hybrid6(uint32_t key);
+    static uint32_t three_hybrid7(uint32_t key);
+    static uint32_t three_hybrid8(uint32_t key);
+    static uint32_t three_hybrid9(uint32_t key);
+    static uint32_t three_hybrid10(uint32_t key);
+    static uint32_t three_hybrid11(uint32_t key);
+    static uint32_t three_hybrid12(uint32_t key);
+
+    static uint32_t four_hybrid1(uint32_t key);
+    static uint32_t four_hybrid2(uint32_t key);
+    static uint32_t four_hybrid3(uint32_t key);
+    static uint32_t four_hybrid4(uint32_t key);
+    static uint32_t four_hybrid5(uint32_t key);
+    static uint32_t four_hybrid6(uint32_t key);
+    static uint32_t four_hybrid7(uint32_t key);
+    static uint32_t four_hybrid8(uint32_t key);
+    static uint32_t four_hybrid9(uint32_t key);
+    static uint32_t four_hybrid10(uint32_t key);
+    static uint32_t four_hybrid11(uint32_t key);
+    static uint32_t four_hybrid12(uint32_t key);
+
+    static uint32_t getHash(uint32_t selector, uint32_t key);
+};
+
+
+
+
+uint32_t folded_xor(uint64_t value, uint32_t num_folds)
+{
+	assert(num_folds > 1);
+	assert((num_folds & (num_folds-1)) == 0); /* has to be power of 2 */
+	uint32_t mask = 0;
+	uint32_t bits_in_fold = 64/num_folds;
+	if(num_folds == 2)
+	{
+		mask = 0xffffffff;
+	}
+	else
+	{
+		mask = (1ul << bits_in_fold) - 1;
+	}
+	uint32_t folded_value = 0;
+	for(uint32_t fold = 0; fold < num_folds; ++fold)
+	{
+		folded_value = folded_value ^ ((value >> (fold * bits_in_fold)) & mask);
+	}
+	return folded_value;
+}
+
+uint32_t HashZoo::jenkins(uint32_t key)
+{
+    // Robert Jenkins' 32 bit mix function
+    key += (key << 12);
+    key ^= (key >> 22);
+    key += (key << 4);
+    key ^= (key >> 9);
+    key += (key << 10);
+    key ^= (key >> 2);
+    key += (key << 7);
+    key ^= (key >> 12);
+    return key;
+}
+
+uint32_t HashZoo::knuth(uint32_t key)
+{
+    // Knuth's multiplicative method
+    key = (key >> 3) * 2654435761;
+    return key;
+}
+
+uint32_t HashZoo::murmur3(uint32_t key)
+{
+	/* TODO: define it using murmur3's finilization steps */
+	assert(false);
+}
+
+/* originally ment for 32b key */
+uint32_t HashZoo::jenkins32(uint32_t key)
+{
+   key = (key+0x7ed55d16) + (key<<12);
+   key = (key^0xc761c23c) ^ (key>>19);
+   key = (key+0x165667b1) + (key<<5);
+   key = (key+0xd3a2646c) ^ (key<<9);
+   key = (key+0xfd7046c5) + (key<<3);
+   key = (key^0xb55a4f09) ^ (key>>16);
+   return key;
+}
+
+/* originally ment for 32b key */
+uint32_t HashZoo::hash32shift(uint32_t key)
+{
+	key = ~key + (key << 15); // key = (key << 15) - key - 1;
+	key = key ^ (key >> 12);
+	key = key + (key << 2);
+	key = key ^ (key >> 4);
+	key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+	key = key ^ (key >> 16);
+	return key;
+}
+
+/* originally ment for 32b key */
+uint32_t HashZoo::hash32shiftmult(uint32_t key)
+{
+	int c2=0x27d4eb2d; // a prime or an odd constant
+	key = (key ^ 61) ^ (key >> 16);
+	key = key + (key << 3);
+	key = key ^ (key >> 4);
+	key = key * c2;
+	key = key ^ (key >> 15);
+	return key;
+}
+
+uint32_t HashZoo::hash64shift(uint32_t key)
+{
+	key = (~key) + (key << 21); // key = (key << 21) - key - 1;
+	key = key ^ (key >> 24);
+	key = (key + (key << 3)) + (key << 8); // key * 265
+	key = key ^ (key >> 14);
+	key = (key + (key << 2)) + (key << 4); // key * 21
+	key = key ^ (key >> 28);
+	key = key + (key << 31);
+	return key;
+}
+
+uint32_t HashZoo::hash5shift(uint32_t key)
+{
+	key = (key ^ 61) ^ (key >> 16);
+    	key = key + (key << 3);
+    	key = key ^ (key >> 4);
+    	key = key * 0x27d4eb2d;
+    	key = key ^ (key >> 15);
+    	return key;
+}
+
+/* hash6shift is jenkin32 */
+
+uint32_t HashZoo::hash7shift(uint32_t key)
+{
+    key -= (key << 6);
+    key ^= (key >> 17);
+    key -= (key << 9);
+    key ^= (key << 4);
+    key -= (key << 3);
+    key ^= (key << 10);
+    key ^= (key >> 15);
+    return key ;
+}
+
+/* use low bit values */
+uint32_t HashZoo::Wang6shift(uint32_t key)
+{
+    key += ~(key << 15);
+    key ^=  (key >> 10);
+    key +=  (key << 3);
+    key ^=  (key >> 6);
+    key += ~(key << 11);
+    key ^=  (key >> 16);
+    return key;
+}
+
+uint32_t HashZoo::Wang5shift(uint32_t key)
+{
+    key = (key + 0x479ab41d) + (key << 8);
+    key = (key ^ 0xe4aa10ce) ^ (key >> 5);
+    key = (key + 0x9942f0a6) - (key << 14);
+    key = (key ^ 0x5aedd67d) ^ (key >> 3);
+    key = (key + 0x17bea992) + (key << 7);
+    return key;
+}
+
+
+uint32_t HashZoo::Wang4shift( uint32_t key)
+{
+    key = (key ^ 0xdeadbeef) + (key << 4);
+    key = key ^ (key >> 10);
+    key = key + (key << 7);
+    key = key ^ (key >> 13);
+    return key;
+}
+
+uint32_t HashZoo::Wang3shift( uint32_t key)
+{
+    key = key ^ (key >> 4);
+    key = (key ^ 0xdeadbeef) + (key << 5);
+    key = key ^ (key >> 11);
+    return key;
+}
+
+uint32_t HashZoo::three_hybrid1(uint32_t key) { return knuth(hash64shift(jenkins32(key))); }
+uint32_t HashZoo::three_hybrid2(uint32_t key) { return jenkins32(Wang5shift(hash5shift(key))); }
+uint32_t HashZoo::three_hybrid3(uint32_t key) { return jenkins(hash32shiftmult(Wang3shift(key))); }
+uint32_t HashZoo::three_hybrid4(uint32_t key) { return Wang6shift(hash32shift(Wang5shift(key))); }
+uint32_t HashZoo::three_hybrid5(uint32_t key) { return hash64shift(hash32shift(knuth(key))); }
+uint32_t HashZoo::three_hybrid6(uint32_t key) { return hash5shift(jenkins(Wang6shift(key))); }
+uint32_t HashZoo::three_hybrid7(uint32_t key) { return Wang4shift(jenkins32(hash7shift(key))); }
+uint32_t HashZoo::three_hybrid8(uint32_t key) { return Wang3shift(Wang6shift(hash64shift(key))); }
+uint32_t HashZoo::three_hybrid9(uint32_t key) { return hash32shift(Wang3shift(jenkins(key))); }
+uint32_t HashZoo::three_hybrid10(uint32_t key) { return hash32shiftmult(Wang4shift(hash32shiftmult(key))); }
+uint32_t HashZoo::three_hybrid11(uint32_t key) { return hash7shift(hash5shift(Wang4shift(key))); }
+uint32_t HashZoo::three_hybrid12(uint32_t key) { return Wang5shift(jenkins32(hash32shift(key))); }
+
+uint32_t HashZoo::four_hybrid1(uint32_t key) { return Wang6shift(Wang5shift(Wang3shift(Wang4shift(key)))); }
+uint32_t HashZoo::four_hybrid2(uint32_t key) { return hash32shiftmult(jenkins(Wang5shift(Wang6shift(key)))); }
+uint32_t HashZoo::four_hybrid3(uint32_t key) { return hash64shift(hash7shift(jenkins32(hash32shift(key)))); }
+uint32_t HashZoo::four_hybrid4(uint32_t key) { return knuth(knuth(hash32shiftmult(hash5shift(key)))); }
+uint32_t HashZoo::four_hybrid5(uint32_t key) { return jenkins32(Wang4shift(hash64shift(hash32shiftmult(key)))); }
+uint32_t HashZoo::four_hybrid6(uint32_t key) { return jenkins(hash32shift(Wang4shift(Wang3shift(key)))); }
+uint32_t HashZoo::four_hybrid7(uint32_t key) { return hash32shift(hash64shift(hash5shift(hash64shift(key)))); }
+uint32_t HashZoo::four_hybrid8(uint32_t key) { return hash7shift(hash5shift(hash32shiftmult(Wang6shift(key)))); }
+uint32_t HashZoo::four_hybrid9(uint32_t key) { return hash32shiftmult(Wang6shift(jenkins32(knuth(key)))); }
+uint32_t HashZoo::four_hybrid10(uint32_t key) { return Wang3shift(jenkins32(knuth(jenkins(key)))); }
+uint32_t HashZoo::four_hybrid11(uint32_t key) { return hash5shift(hash32shiftmult(hash32shift(jenkins32(key)))); }
+uint32_t HashZoo::four_hybrid12(uint32_t key) { return Wang4shift(Wang3shift(jenkins(hash7shift(key)))); }
+
+
+uint32_t HashZoo::getHash(uint32_t selector, uint32_t key)
+{
+    switch(selector)
+    {
+        case 1:     return key;
+        case 2:     return jenkins(key);
+        case 3:     return knuth(key);
+        case 4:     return murmur3(key);
+        case 5:     return jenkins32(key);
+        case 6:     return hash32shift(key);
+        case 7:     return hash32shiftmult(key);
+        case 8:     return hash64shift(key);
+        case 9:     return hash5shift(key);
+        case 10:    return hash7shift(key);
+        case 11:    return Wang6shift(key);
+        case 12:    return Wang5shift(key);
+        case 13:    return Wang4shift(key);
+        case 14:    return Wang3shift(key);
+
+        /* three hybrid */
+        case 101:  return three_hybrid1(key);
+        case 102:  return three_hybrid2(key);
+        case 103:  return three_hybrid3(key);
+        case 104:  return three_hybrid4(key);
+        case 105:  return three_hybrid5(key);
+        case 106:  return three_hybrid6(key);
+        case 107:  return three_hybrid7(key);
+        case 108:  return three_hybrid8(key);
+        case 109:  return three_hybrid9(key);
+        case 110:  return three_hybrid10(key);
+        case 111:  return three_hybrid11(key);
+        case 112:  return three_hybrid12(key);
+
+        /* four hybrid */
+        case 1001:  return four_hybrid1(key);
+        case 1002:  return four_hybrid2(key);
+        case 1003:  return four_hybrid3(key);
+        case 1004:  return four_hybrid4(key);
+        case 1005:  return four_hybrid5(key);
+        case 1006:  return four_hybrid6(key);
+        case 1007:  return four_hybrid7(key);
+        case 1008:  return four_hybrid8(key);
+        case 1009:  return four_hybrid9(key);
+        case 1010:  return four_hybrid10(key);
+        case 1011:  return four_hybrid11(key);
+        case 1012:  return four_hybrid12(key);
+
+        default:    assert(false);
+    }
+}
+
+uint32_t getMaxAction(State *state, uint32_t feature);
+uint32_t process_PC(uint32_t tiling, uint64_t pc);
+uint32_t process_offset(uint32_t tiling, uint32_t offset);
+uint32_t process_Page(uint32_t tiling, uint64_t page);
+uint32_t get_tile_index(uint32_t tiling, State *state, uint32_t feature);
+float getQ(uint32_t tiling, uint32_t tile_index, uint32_t action, uint32_t feature);
+void setQ(uint32_t tiling, uint32_t tile_index, uint32_t action, float value, uint32_t feature);
+float retrieveQ(State *state, uint32_t action, uint32_t feature);
+float consultQ(State *state, uint32_t action);
+uint32_t getMaxAction(State *state,  bool enable_bypass);
+uint64_t random_flag(uint64_t random_action);
+uint32_t random_select_action(bool enable_bypass);
+uint32_t chooseAction(State *state, bool enable_bypass);
+void updateQ(State *state1, uint32_t action1, int32_t reward, State *state2, uint32_t action2, uint32_t feature);
+void learn(State *state1, uint32_t action1, int32_t reward, State *state2, uint32_t action2);
+int32_t compute_reward(Naper_EQEntry *eqentry, int32_t type);
+void assign_reward(Naper_EQEntry *eqentry, int32_t type);
+void reward(Naper_EQEntry *eqentry);
+vector<Naper_EQEntry*> search_eq(uint64_t address, bool search_all, uint32_t set);
+void reward(uint64_t address, uint64_t pure_miss, bool prefetch, uint32_t set, uint64_t time);
+void train(Naper_EQEntry *curr_evicted, Naper_EQEntry *last_evicted);
+bool track(uint64_t address, State *state, uint32_t action_index, Naper_EQEntry **tracker, bool in_cache, uint32_t set, uint64_t time);
+uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core);
+bool hit_eq_check(uint64_t address, uint32_t set);
+Scooby_STEntry* update_local_state(uint64_t pc, uint64_t page, uint32_t offset, uint64_t address);
+void print_eq(uint32_t set);
+
+
+uint32_t getMaxAction(State *state, uint32_t feature)
+{
+	float max_q_value = 0.0, q_value = 0.0;
+	uint32_t selected_action = 0, init_index = 0;
+	uint32_t m_actions = NUM_ACTION;
+	for(uint32_t action = init_index; action < m_actions; ++action)
+	{
+		q_value = retrieveQ(state, action, feature);
+		if(q_value > max_q_value)
+		{
+			max_q_value = q_value;
+			selected_action = action;
+		}
+	}
+	return selected_action;
+}
+
+
+
+
+uint32_t process_PC(uint32_t tiling, uint64_t pc)
+{
+	uint32_t m_num_tiles = NUM_TILE;
+	uint32_t raw_index = folded_xor(pc, 2); /* 32-b folded XOR */
+	uint32_t m_hash_type = HASH_TYPE;
+	raw_index = raw_index ^ tiling_offset[tiling];
+	uint32_t hashed_index = HashZoo::getHash(m_hash_type, raw_index);
+	return (hashed_index % m_num_tiles);
+}
+
+
+uint32_t process_offset(uint32_t tiling, uint32_t offset)
+{
+	uint32_t m_num_tiles = NUM_TILE;
+	offset = offset ^ tiling_offset[tiling];
+	uint32_t m_hash_type = HASH_TYPE;
+	uint32_t hashed_index = HashZoo::getHash(m_hash_type, offset);
+	return (hashed_index % m_num_tiles);
+}
+
+uint32_t process_Page(uint32_t tiling, uint64_t page)
+{
+	uint32_t m_num_tiles = NUM_TILE;
+	uint32_t raw_index = folded_xor(page, 2); /* 32-b folded XOR */
+	uint32_t m_hash_type = HASH_TYPE;
+	raw_index = raw_index ^ tiling_offset[tiling];
+	uint32_t hashed_index = HashZoo::getHash(m_hash_type, raw_index);
+	return (hashed_index % m_num_tiles);
+
+}
+
+uint32_t process_PC_path(uint32_t tiling, uint32_t pc_path)
+{
+	uint32_t m_num_tiles = NUM_TILE;
+	uint32_t m_hash_type = HASH_TYPE;
+	pc_path = pc_path ^ tiling_offset[tiling];
+	uint32_t hashed_index = HashZoo::getHash(m_hash_type, pc_path);
+	return (hashed_index % m_num_tiles);
+}
+
+
+
+
+uint32_t get_tile_index(uint32_t tiling, State *state, uint32_t feature)
+{
+	uint64_t pc = state->pc;
+	uint64_t page = state->page;
+	uint32_t offset = state->offset;
+	uint32_t pc_path = state->pc_path;
+
+	//feature 0 is PC; feature 1 is offset; feature 2 is 2pc_path 
+	switch(feature)
+	{
+		case 0: return process_PC(tiling, pc);
+		case 1: return process_Page(tiling, page);
+		case 2 : return process_PC_path(tiling, pc_path);
+		default: assert(false); return 0;
+	}
+}
+
+
+
+float getQ(uint32_t tiling, uint32_t tile_index, uint32_t action, uint32_t feature)
+{
+	assert(feature < NUM_FEATURE);
+	assert(tiling < NUM_TILING);
+	assert(tile_index < NUM_TILE);
+	assert(action < NUM_ACTION);
+	return q_table[feature][tiling][tile_index][action];
+}
+
+
+
+void setQ(uint32_t tiling, uint32_t tile_index, uint32_t action, float value, uint32_t feature)
+{
+	uint32_t m_num_tiles = NUM_TILE;
+	uint32_t m_num_tilings = NUM_TILING;
+	uint32_t m_actions = NUM_ACTION;
+	assert(tiling < m_num_tilings);
+	assert(tile_index < m_num_tiles);
+	assert(action < m_actions);
+	q_table[feature][tiling][tile_index][action] = value;
+}
+
+
+
+float retrieveQ(State *state, uint32_t action, uint32_t feature)
+{
+	uint32_t tile_index = 0;
+	float q_value = 0.0;
+	uint32_t m_num_tilings = NUM_TILING;
+
+	for(uint32_t tiling = 0; tiling < m_num_tilings; ++tiling)
+	{
+		tile_index = get_tile_index(tiling, state, feature);
+		q_value += getQ(tiling, tile_index, action, feature);
+	}
+
+	return q_value;
+}
+
+
+float consultQ(State *state, uint32_t action)
+{
+
+	float q_value = 0.0;
+	float max = -1000000000.0;
+
+	/* pool Q-value accross all feature tables */
+	for(uint32_t feature = 0; feature < NUM_FEATURE; ++feature)
+	{
+		float tmp = retrieveQ(state, action, feature);
+		if(tmp >= max)
+		{
+			max = tmp;
+			q_value = tmp;
+		}
+	}
+	return q_value;
+}
+
+
+uint32_t getMaxAction(State *state, bool enable_bypass)
+{
+	uint32_t m_actions = NUM_ACTION;
+	if(enable_bypass == false)
+	{
+		m_actions = NUM_ACTION - 1;
+	}
+	float max_q_value = 0.0, q_value = 0.0;
+	uint32_t selected_action = 0, init_index = 0;
+	for(uint32_t action = init_index; action < m_actions; ++action)
+	{
+		q_value = consultQ(state, action);
+
+
+		if(q_value > max_q_value)
+		{
+			max_q_value = q_value;
+			selected_action = action;
+		}
+	}
+	return selected_action;
+}
+
+
+
+std::default_random_engine m_generator(SEED);
+std::bernoulli_distribution m_explore(EPSILON);
+std::uniform_int_distribution<int> m_actiongen(0, NUM_ACTION-1);
+
+
+uint64_t random_flag(uint64_t random_action)
+{
+
+     if(m_explore(m_generator))
+     {
+        random_action = 1;
+     }
+     else
+     {
+     	random_action = 0;
+     }
+     return random_action;
+}
+
+
+uint32_t random_select_action(bool enable_bypass)
+{
+	uint32_t action = m_actiongen(m_generator); // take random action
+	return action;
+}
+
+
+uint32_t chooseAction(State *state, bool enable_bypass)
+{
+	uint32_t action = 0;
+
+	action = getMaxAction(state, enable_bypass);
+	return action;
+}
+
+
+void updateQ(State *state1, uint32_t action1, int32_t reward, State *state2, uint32_t action2, uint32_t feature)
+{
+	uint32_t tile_index1 = 0, tile_index2 = 0;
+	float Qsa1, Qsa2;
+	uint32_t m_num_tilings = NUM_TILING;
+	float m_alpha = ALPHA;
+	float m_gamma = GAMMA;
+
+	for(uint32_t tiling = 0; tiling < m_num_tilings; ++tiling)
+	{
+		tile_index1 = get_tile_index(tiling, state1, feature);
+		tile_index2 = get_tile_index(tiling, state2, feature);
+		Qsa1 = getQ(tiling, tile_index1, action1, feature);
+		Qsa2 = getQ(tiling, tile_index2, action2, feature);
+		/* SARSA */
+		Qsa1 = Qsa1 + m_alpha * ((float)reward + m_gamma * Qsa2 - Qsa1);
+		setQ(tiling, tile_index1, action1, Qsa1, feature);
+	}
+}
+
+
+void learn(State *state1, uint32_t action1, int32_t reward, State *state2, uint32_t action2)
+{
+	for(uint32_t feature = 0; feature < NUM_FEATURE; ++feature)
+	{
+		updateQ(state1, action1, reward, state2, action2, feature);
+	}
+
+}
+
+int32_t compute_reward(Naper_EQEntry *eqentry, int32_t type)
+{
+	int32_t reward = 0;
+	if(type == GOOD_DECISION_LOW_CAL_TYPE)
+	{
+		reward = GOOD_DECISION_LOW_CAL;
+	}
+	else if (type == GOOD_DECISION_HIGH_CAL_TYPE)
+	{
+		reward = GOOD_DECISION_HIGH_CAL;
+	}
+	else if (type == BAD_DECISION_LOW_CAL_TYPE)
+	{
+		reward = BAD_DECISION_LOW_CAL;
+	}
+	else
+	{
+		reward = BAD_DECISION_HIGH_CAL;
+	}
+	return reward;
+}
+
+
+void assign_reward(Naper_EQEntry *eqentry, int32_t type)
+{
+	int32_t reward = compute_reward(eqentry, type);
+	/* assign */
+	eqentry->reward = reward;
+	eqentry->reward_type = type;
+	eqentry->has_reward = true;
+}
+
+/* This reward function is called during eviction from EQ */
+void reward(Naper_EQEntry *eqentry)
+{
+	cal_level = c;
+	if(cal_level == 0 || cal_level == 1)
+	{
+		if(eqentry->action_index == BYPASSING)
+		{
+			assign_reward(eqentry, GOOD_DECISION_LOW_CAL_TYPE);
+		}
+		else
+		{
+			assign_reward(eqentry, BAD_DECISION_LOW_CAL_TYPE);
+		}
+	}
+	else
+	{
+		if(eqentry->action_index == BYPASSING)
+		{
+			assign_reward(eqentry, GOOD_DECISION_HIGH_CAL_TYPE);
+		}
+		else
+		{
+			assign_reward(eqentry, BAD_DECISION_HIGH_CAL_TYPE);
+		}
+	}
+	eqentry->has_reward = true;
+}
+
+
+void print_eq(uint32_t set)
+{
+        for(uint32_t index = 0; index < evaluation_queue[0].size(); ++index)
+        {
+		cout << "evaluation_queue" << " set: " << set << " index: " << index << " address: " <<  evaluation_queue[0][index]->address  << " insert time: " << evaluation_queue[0][index]->time << " reward: " << evaluation_queue[0][index]->reward << endl;
+	}
+}
+
+
+vector<Naper_EQEntry*> search_eq(uint64_t address, bool search_all, uint32_t set)
+{
+	vector<Naper_EQEntry*> entries;
+	for(uint32_t index = 0; index < evaluation_queue[0].size(); ++index)
+	{
+		if(evaluation_queue[0][index]->address == address && evaluation_queue[0][index]->has_reward == false)
+		{
+			entries.push_back(evaluation_queue[0][index]);
+			if(search_all == false) 
+			{
+				break;
+			}
+		}
+	}
+	return entries;
+}
+
+bool hit_eq_check(uint64_t address, uint32_t set)
+{
+	vector<Naper_EQEntry*> eqentries = search_eq(address, true, set);
+	if(eqentries.empty())
+	{
+		return false;
+	}	
+	return true;
+}
+
+
+
+
+
+
+
+/* 
+	This reward fucntion is called after seeing a demand/prefetch access to the address in the EQ
+ 	Currently, it just rewards the oldest state-action pair to the address
+ */
+
+void reward(uint64_t address, uint64_t pure_miss, bool prefetch, uint32_t set, uint64_t time)
+{
+	cal_level = c;
+	bool search_all = true;
+	if(REWARD_ALL == 1)
+	{
+		search_all = true;
+	}
+	vector<Naper_EQEntry*> eqentries = search_eq(address, search_all, set);
+	
+	if(eqentries.empty())
+	{
+		return;
+	}
+
+	for(uint32_t index = 0; index < eqentries.size(); ++index)
+	{
+		Naper_EQEntry *eqentry = eqentries[index];
+		/* Do not compute reward if already has a reward.*/
+		if(eqentry->has_reward)
+		{
+			continue;
+		}
+		else
+		{
+			//cout << "Before Assign: " << endl;
+                        //print_eq(set);
+			//cout << "Current Time: " << time << " Address: " << address << endl;	
+	
+			if(cal_level == 0 || cal_level == 1)
+			{
+				if(eqentry->action_index == BYPASSING)
+				{
+					assign_reward(eqentry, BAD_DECISION_LOW_CAL_TYPE);
+				}
+				else
+				{
+					assign_reward(eqentry, GOOD_DECISION_LOW_CAL_TYPE);
+				}
+			}
+			else
+			{
+				if(eqentry->action_index == BYPASSING)
+				{
+					assign_reward(eqentry, BAD_DECISION_HIGH_CAL_TYPE);
+				}
+				else
+				{
+					assign_reward(eqentry, GOOD_DECISION_HIGH_CAL_TYPE);
+				}
+			}
+
+			eqentry->has_reward = true;
+			//cout << "After Assign: " << endl;
+			//print_eq(set);
+			return;
+		
+		}
+	}
+
+}
+
+
+/* train the agent */
+
+void train(Naper_EQEntry *curr_evicted, Naper_EQEntry *last_evicted)
+{
+	if(!last_evicted->has_reward)
+	{
+		reward(last_evicted);
+	}
+	learn(last_evicted->state, last_evicted->action_index, last_evicted->reward, curr_evicted->state, curr_evicted->action_index);
+}
+
+
+
+bool track(uint64_t address, State *state, uint32_t action_index, Naper_EQEntry **tracker, bool in_cache, uint32_t set, uint64_t time)
+{
+	bool new_addr = true;
+	bool search_all = true;
+	vector<Naper_EQEntry*> eqentries = search_eq(address, search_all, set);
+	if(eqentries.empty())
+	{
+		new_addr = true;
+	}
+	else
+	{
+		new_addr = false;
+	}
+
+	Naper_EQEntry *eqentry = NULL;
+	if(evaluation_queue[0].size() >= eq_size)
+	{
+		eqentry = evaluation_queue[0].front();
+		evaluation_queue[0].pop_front();
+		if(last_evicted_eqentry[set])
+		{
+			//cout << "Evict Before Assign: " << endl;
+			//print_eq(set);
+			train(eqentry, last_evicted_eqentry[set]);
+			//cout << "Evict After Assign: " << endl;
+			//print_eq(set);
+			delete last_evicted_eqentry[set]->state;
+			delete last_evicted_eqentry[set];
+		}
+		last_evicted_eqentry[set] = eqentry;
+	}
+	Naper_EQEntry *new_eqentry = NULL;
+	new_eqentry = new Naper_EQEntry(address, state, action_index, in_cache, time);
+	evaluation_queue[0].push_back(new_eqentry);
+
+	(*tracker) = new_eqentry;
+	return new_addr;
+}
+
+uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core)
+{
+	if (NUM_CPUS == 1) 
+	{
+        	pc = pc << 1;
+        	if(hit) 
+		{
+            		pc = pc | 1;
+        	}
+        	pc = pc << 1;
+        	if (prefetch) 
+		{
+            		pc = pc | 1;                            
+        	}
+    	} 
+	else 
+	{
+        	pc = pc << 1;
+        	if(prefetch) 
+		{
+            		pc = pc | 1;
+        	}
+        	pc = pc << 2;
+        	pc = pc | core;
+    	}
+	return pc;
+}
+
+
+
+Scooby_STEntry* update_local_state(uint64_t pc, uint64_t page, uint32_t offset, uint64_t address)
+{
+	Scooby_STEntry *stentry = NULL;
+	auto st_index =  std::find_if(signature_table.begin(), signature_table.end(), [page](Scooby_STEntry *stentry){return stentry->page == page;});
+	if(st_index != signature_table.end())
+	{
+		stentry = (*st_index);
+		stentry->update(page, pc, offset, address);
+		signature_table.erase(st_index);
+		signature_table.push_back(stentry);
+		return stentry;
+	}
+	else
+	{
+		if(signature_table.size() >= scooby_st_size)
+		{
+			stentry = signature_table.front();
+			signature_table.pop_front();
+			delete stentry;
+		}
+		stentry = new Scooby_STEntry(page, pc, offset);
+		signature_table.push_back(stentry);
+		return stentry;
+	}
+}
+
+
+
+
+
+
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+	for(int i = 0; i < LLC_SET; i++)
+	{
+		last_evicted_eqentry[i] = NULL;
+	}
+
+	cout << "llc_initialize_replacement begin "<< endl;
+	bool zero_init = false;
+
+	// q table
+    	float m_init_value;
+    	float gamma = GAMMA;
+	cout << "initialize q table " << endl;
+    	if(zero_init)
+    	{
+    		m_init_value = 0;
+    	}
+    	else
+    	{
+        	m_init_value = (float)1ul/(1-gamma);
+    	}
+    	for(uint32_t feature = 0; feature < NUM_FEATURE; ++feature)
+    	{
+    		for(uint32_t tiling = 0; tiling < NUM_TILING; ++tiling)
+        	{
+        		for(uint32_t tile = 0; tile < NUM_TILE; ++tile)
+            		{
+            			for(uint32_t action = 0; action < NUM_ACTION; ++action)
+                		{
+                			q_table[feature][tiling][tile][action] = m_init_value;
+                		}
+            		}
+        	}
+    	}
+	cout << "initialize sampled sets " << endl;
+	// which sets are sampled sets 
+	int leaders = 0;
+    	while(leaders < NUM_LEADER_SETS)
+	{
+		if(set_sample[leaders] == 0)
+		{
+			set_sample[leaders] = 1;
+			leaders++;
+      		}
+    	}
+
+}
+
+
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type, uint64_t time)
+{
+	return lru_victim(cpu, instr_id, set, current_set, ip, full_addr, type);
+}
+
+
+// called on every cache hit and cache fill
+uint32_t CACHE::llc_update_bypass_state_decision(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint64_t pure_miss, uint64_t time)
+{
+	/*
+		Compute reward on demand
+      		if the demand address (full_addr) in the Evaluation Queue (EQ), assign rewards
+    	*/
+
+	//cout << "Current Time: " << time << endl;
+
+	if(set_sample[set] == 1 && type != WRITEBACK)
+	{
+		demand++;
+	
+		if(hit_eq_check(full_addr, set))
+		{
+			eq_hit++;			
+		}		
+		//cout << "Search Addr: " << full_addr << endl;
+		//cout << "Before Assign: " << endl;
+		//print_eq(set);
+		if(hit)
+		{
+			reward(full_addr, 0, type == PREFETCH, set, time);
+		}
+		else
+		{
+			reward(full_addr, pure_miss, type == PREFETCH, set, time);
+		}
+		//cout << "After Assign: " << endl;
+		//print_eq(set);
+	}
+	// prediction and inset new entry into EQ
+	if(!hit)
+	{
+        	uint64_t page = full_addr >> LOG2_PAGE_SIZE;
+        	uint32_t offset = (full_addr >> LOG2_BLOCK_SIZE) & ((1ull << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) - 1);
+        	State *state = new State();
+        	state->pc = get_pc_signature(ip, false, type == PREFETCH, cpu);
+        	state->address = full_addr;
+        	state->page = page;
+        	state->offset = offset;
+        	state->core = cpu;
+
+        	Scooby_STEntry *stentry = update_local_state(ip, page, offset, full_addr);
+        	state->pc_path = stentry->get_pcs_sig();
+
+        	uint32_t action = 0;
+        	uint32_t random_action = 0;
+        	random_action = random_flag(random_action);
+        	if(random_action == 1)
+        	{
+                	action = random_select_action(true);
+        	}
+        	else
+        	{
+                	action = chooseAction(state, true);
+        	}
+        	if(action == BYPASSING && type != WRITEBACK)
+        	{
+                	by_count++;
+               	 	if(set_sample[set] == 1)
+                	{
+				//cout << "Before insetion: " << endl;
+				//print_eq(set);
+				Naper_EQEntry *eqentry = NULL;
+                        	bool new_addr = track(full_addr, state, BYPASSING,  &eqentry, false, set, time);
+                		//cout << "After insetion: " << endl;
+                                //print_eq(set);
+			}
+                	return 1;
+        	}
+        	else
+        	{
+                	re_count++;
+                	if(set_sample[set] == 1 && type != WRITEBACK)
+                	{
+                                //cout << "Before insetion: " << endl;
+                                //print_eq(set);                 
+			       	Naper_EQEntry *eqentry = NULL;
+                        	bool new_addr = track(full_addr, state, INSERTING,  &eqentry, true, set, time);
+                                //cout << "After insetion: " << endl;
+                                //print_eq(set);
+
+			}
+                	return 0;
+        	}		
+	}	
+	return 0;
+}
+
+
+
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint64_t pure_miss)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the LLC accesses
+    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    // baseline LRU
+    if(way == NUM_WAY)
+    {
+    	return;
+    }
+ 
+   if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+
+    return lru_update(set, way);
+}
+
+
+
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::llc_replacement_final_stats()
+{
+	cout << "eq_hit: " << eq_hit << endl;
+	cout << "demand: " << demand << endl;
+	cout << "eq_hit_rate: " << (float) eq_hit / demand << endl;
+}
+
+
+void CACHE::llc_replacement_broadcast_bw(uint8_t bw_level)
+{
+
+}
+
+
+void CACHE::llc_replacement_broadcast_cal_level(uint32_t cal)
+{
+	c = cal;
+}
+
+

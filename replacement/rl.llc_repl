@@ -15,12 +15,17 @@
 #define INSERTING 0
 #define BYPASSING 1
 
-#define EPSILON 0.13533528323
-#define ALPHA 0.44932896411
-#define GAMMA 0.36787944117
-#define NUM_FEATURE 3
+//#define EPSILON 0.00673794699
+
+#define EPSILON 0.01
+#define EPSILON_DECAY 0.99
+float epsilon = EPSILON;
+
+#define ALPHA 0.08208499862
+#define GAMMA 0.44932896411
+#define NUM_FEATURE 2
 #define NUM_TILING 3
-#define NUM_TILE 128
+#define NUM_TILE 64
 #define NUM_ACTION 2 // 0: inserting, 1: bypassing
 #define SEED 200
 #define HASH_TYPE 2
@@ -42,7 +47,7 @@
 
 uint32_t cal_level = 0;
 uint32_t set_sample[LLC_SET];
-#define NUM_LEADER_SETS   64
+#define NUM_LEADER_SETS 16
 uint32_t c = 0;
 int eq_hit = 0;
 int demand = 0;
@@ -655,12 +660,32 @@ std::default_random_engine m_generator(SEED);
 std::bernoulli_distribution m_explore(EPSILON);
 std::uniform_int_distribution<int> m_actiongen(0, NUM_ACTION-1);
 
-
+/*
 uint64_t random_flag(uint64_t random_action)
 {
 
      if(m_explore(m_generator))
      {
+        random_action = 1;
+     }
+     else
+     {
+     	random_action = 0;
+     }
+     return random_action;
+}
+*/
+
+uint64_t random_flag(uint64_t random_action)
+{
+
+     if(m_explore(m_generator))
+     {	
+	if(epsilon > 0.006)
+	{
+		epsilon = epsilon * EPSILON_DECAY;
+	}
+	 	//cout << "current epsilon: " << epsilon << endl;
         random_action = 1;
      }
      else

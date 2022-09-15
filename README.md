@@ -29,7 +29,8 @@ will create the binary perceptron-no-no-no-rl-4core (4-core configuration).
 Simuations are defined in ./4-core.sh. (only SPEC CPU 2017 traces are defined in /4-core.sh by default)
 
 
-#### Explore the impact of sampling on performance:
-The number of sampled sets can be changed by changing the NUM_LEADER_SETS in line 50. To explore the impact of sampling on performance, the NUM_LEADER_SETS are set to 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192.
+#### Explore the impact of sampling on performance:     
+The number of sampled sets can be changed by changing the NUM_LEADER_SETS in line 50.   
+To explore the impact of sampling on performance, the NUM_LEADER_SETS are set to 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192.    
 Please check the script ./optimization_eq.sh, which can help execute the ./4-core.sh with different numbers of sampled sets.  
 
